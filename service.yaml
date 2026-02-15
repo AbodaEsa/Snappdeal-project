@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: snapdeal-app
+  namespace: snapdeal
+spec:
+  type: ClusterIP
+  selector:
+    app: snapdeal-app
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
