@@ -1,0 +1,194 @@
+# Dockerfile.prod - Fixed to handle read-only ConfigMap .env
+FROM php:8.3-fpm AS php-base
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    supervisor nginx \
+    libzip-dev libpng-dev libjpeg-dev libfreetype6-dev \
+    libonig-dev libxml2-dev libcurl4-openssl-dev libpq-dev \
+    git unzip zip curl netcat-traditional \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN docker-php-ext-configure gd --with-freetype --with-jpeg \
+ && docker-php-ext-install -j"$(nproc)" \
+    pdo pdo_mysql pdo_pgsql zip mbstring exif pcntl bcmath gd
+
+RUN pecl install redis && docker-php-ext-enable redis opcache
+
+# Add PHP config to suppress deprecation warnings
+RUN echo "error_reporting = E_ALL & ~E_DEPRECATED & ~E_USER_DEPRECATED" > /usr/local/etc/php/conf.d/no-deprecation.ini
+
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+
+FROM php-base AS dependencies
+WORKDIR /app
+COPY composer.json composer.lock ./
+RUN composer install --no-dev --no-scripts --no-autoloader --prefer-dist
+
+FROM php-base AS production
+
+WORKDIR /var/www/snapdeal
+
+COPY --from=dependencies /app/vendor ./vendor
+COPY . .
+
+# Create .env from .env.example if it doesn't exist
+RUN if [ ! -f .env ]; then \
+        cp .env.example .env; \
+        echo " .env file created from .env.example"; \
+    fi
+
+RUN composer dump-autoload --optimize --no-dev
+
+COPY docker/nginx/default.conf /etc/nginx/sites-available/default
+
+# Create supervisord config
+RUN cat << 'EOF' > /etc/supervisord.conf
+[supervisord]
+nodaemon=true
+logfile=/tmp/supervisord.log
+pidfile=/tmp/supervisord.pid
+
+[program:php-fpm]
+command=/usr/local/sbin/php-fpm -F
+autostart=true
+autorestart=true
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+
+[program:nginx]
+command=/usr/sbin/nginx -g 'daemon off;'
+autostart=true
+autorestart=true
+stdout_logfile=/dev/stdout
+stdout_logfile_maxbytes=0
+stderr_logfile=/dev/stderr
+stderr_logfile_maxbytes=0
+EOF
+
+# CRITICAL: Fix permissions permanently
+RUN mkdir -p storage/logs storage/app/public storage/framework/{cache,sessions,views} bootstrap/cache \
+    && touch storage/logs/laravel.log \
+    && chmod -R 777 storage \
+    && chmod -R 777 bootstrap/cache \
+    && mkdir -p /var/lib/nginx/body /var/cache/nginx \
+    && chmod -R 755 /var/lib/nginx /var/cache/nginx
+
+# IMPORTANT: Set ownership
+RUN chown -R www-data:www-data /var/www/snapdeal
+
+# Create startup script - HANDLES READ-ONLY ConfigMap .env
+RUN cat << 'EOF' > /start.sh
+#!/bin/bash
+set -e
+
+echo "=========================================="
+echo "  Starting SnapDeal Application"
+echo "=========================================="
+echo ""
+
+# Step 1: Ensure .env exists
+if [ ! -f /var/www/snapdeal/.env ]; then
+    echo " Creating .env from .env.example..."
+    cp /var/www/snapdeal/.env.example /var/www/snapdeal/.env
+fi
+
+# Step 2: Generate APP_KEY if not set
+echo " Checking APP_KEY..."
+if ! grep -q "APP_KEY=base64:" /var/www/snapdeal/.env; then
+    echo " Generating APP_KEY..."
+    php artisan key:generate --force
+    echo " APP_KEY generated"
+else
+    echo " APP_KEY already exists"
+fi
+
+# Step 3: Fix permissions - HANDLE READ-ONLY .env from ConfigMap
+echo " Fixing permissions..."
+
+# Check if .env is writable (not from ConfigMap)
+if [ -w /var/www/snapdeal/.env ]; then
+    echo "   .env is writable - updating permissions..."
+    chmod 644 /var/www/snapdeal/.env
+    chown www-data:www-data /var/www/snapdeal/.env 2>/dev/null || true
+else
+    echo "   ℹ  .env is read-only (mounted from ConfigMap) - skipping chmod"
+fi
+
+# Always fix storage and bootstrap (these are always writable)
+echo "   Fixing storage permissions..."
+chmod -R 777 /var/www/snapdeal/storage 2>/dev/null || true
+chmod -R 777 /var/www/snapdeal/bootstrap/cache 2>/dev/null || true
+chown -R www-data:www-data /var/www/snapdeal/storage 2>/dev/null || true
+chown -R www-data:www-data /var/www/snapdeal/bootstrap/cache 2>/dev/null || true
+
+# Ensure log file exists and is writable
+mkdir -p /var/www/snapdeal/storage/logs
+touch /var/www/snapdeal/storage/logs/laravel.log 2>/dev/null || true
+chmod 666 /var/www/snapdeal/storage/logs/laravel.log 2>/dev/null || true
+
+echo " Permissions fixed"
+
+# Step 4: Wait for database
+echo ""
+echo " Waiting for database at ${DB_PG_HOST}:${DB_PG_PORT}..."
+MAX_ATTEMPTS=60
+ATTEMPT=0
+
+while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+    if nc -zv ${DB_PG_HOST} ${DB_PG_PORT} 2>/dev/null; then
+        echo " Database is ready"
+        break
+    fi
+    ATTEMPT=$((ATTEMPT + 1))
+    echo "   Attempt $ATTEMPT/$MAX_ATTEMPTS: waiting..."
+    sleep 1
+done
+
+if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+    echo " Database timeout - continuing anyway..."
+fi
+
+# Step 5: Run migrations
+echo ""
+echo "  Running database migrations..."
+if [ "$RUN_MIGRATIONS" = "true" ]; then
+    if php artisan migrate --force 2>&1 | tee /var/www/snapdeal/storage/logs/migration.log; then
+        echo " Migrations completed successfully"
+    else
+        echo "  Migration completed with warnings (normal on fresh install)"
+    fi
+else
+    echo "  Migrations skipped (RUN_MIGRATIONS != true)"
+fi
+
+# Step 6: Prepare storage
+echo ""
+echo " Preparing storage..."
+php artisan storage:link --force 2>/dev/null || echo "   Storage link already exists"
+
+# Step 7: Clear caches
+echo " Clearing application caches..."
+php artisan config:clear 2>/dev/null || true
+php artisan route:clear 2>/dev/null || true
+php artisan view:clear 2>/dev/null || true
+php artisan cache:clear 2>/dev/null || true
+
+echo ""
+echo "=========================================="
+echo " Application Ready!"
+echo "=========================================="
+echo ""
+
+exec /usr/bin/supervisord -n -c /etc/supervisord.conf
+EOF
+
+RUN chmod +x /start.sh
+
+# Expose port 80 for Nginx
+EXPOSE 80
+
+
+
+CMD ["/start.sh"]
